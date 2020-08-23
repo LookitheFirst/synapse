@@ -762,6 +762,16 @@ class RoomCreationHandler(BaseHandler):
                 ratelimit=False,
                 content=content,
             )
+            
+            if is_direct:
+                await self.room_member_handler.update_membership(
+                    create_requester(UserID.from_string(invitee)),
+                    UserID.from_string(invitee),
+                    room_id,
+                    "join",
+                    ratelimit=False,
+                    content=content,
+                )
 
         for invite_3pid in invite_3pid_list:
             id_server = invite_3pid["id_server"]
