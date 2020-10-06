@@ -185,7 +185,7 @@ if TYPE_CHECKING:
 # Helper class
 
 
-class _DummyTagNames(object):
+class _DummyTagNames:
     """wrapper of opentracings tags. We need to have them if we
     want to reference them without opentracing around. Clearly they
     should never actually show up in a trace. `set_tags` overwrites
@@ -509,7 +509,7 @@ def start_active_span_from_edu(
     ]
 
     # For some reason jaeger decided not to support the visualization of multiple parent
-    # spans or explicitely show references. I include the span context as a tag here as
+    # spans or explicitly show references. I include the span context as a tag here as
     # an aid to people debugging but it's really not an ideal solution.
 
     references += _references

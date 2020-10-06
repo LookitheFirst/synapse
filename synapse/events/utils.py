@@ -49,6 +49,11 @@ def prune_event(event: EventBase) -> EventBase:
         pruned_event_dict, event.room_version, event.internal_metadata.get_dict()
     )
 
+    # copy the internal fields
+    pruned_event.internal_metadata.stream_ordering = (
+        event.internal_metadata.stream_ordering
+    )
+
     # Mark the event as redacted
     pruned_event.internal_metadata.redacted = True
 
@@ -322,7 +327,7 @@ def serialize_event(
     return d
 
 
-class EventClientSerializer(object):
+class EventClientSerializer:
     """Serializes events that are to be sent to clients.
 
     This is used for bundling extra information with any events to be sent to

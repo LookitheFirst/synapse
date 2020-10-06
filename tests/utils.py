@@ -38,6 +38,7 @@ from synapse.http.server import HttpServer
 from synapse.logging.context import current_context, set_current_context
 from synapse.server import HomeServer
 from synapse.storage import DataStore
+from synapse.storage.database import LoggingDatabaseConnection
 from synapse.storage.engines import PostgresEngine, create_engine
 from synapse.storage.prepare_database import prepare_database
 from synapse.util.ratelimitutils import FederationRateLimiter
@@ -88,6 +89,7 @@ def setupdb():
             host=POSTGRES_HOST,
             password=POSTGRES_PASSWORD,
         )
+        db_conn = LoggingDatabaseConnection(db_conn, db_engine, "tests")
         prepare_database(db_conn, db_engine, None)
         db_conn.close()
 
@@ -276,7 +278,7 @@ def setup_test_homeserver(
 
         hs.setup()
         if homeserverToUse.__name__ == "TestHomeServer":
-            hs.setup_master()
+            hs.setup_background_tasks()
 
         if isinstance(db_engine, PostgresEngine):
             database = hs.get_datastores().databases[0]
@@ -472,7 +474,7 @@ class MockHttpResource(HttpServer):
             self.callbacks.append((method, path_pattern, callback))
 
 
-class MockKey(object):
+class MockKey:
     alg = "mock_alg"
     version = "mock_version"
     signature = b"\x9a\x87$"
@@ -491,7 +493,7 @@ class MockKey(object):
         return b"<fake_encoded_key>"
 
 
-class MockClock(object):
+class MockClock:
     now = 1000
 
     def __init__(self):
@@ -568,7 +570,7 @@ def _format_call(args, kwargs):
     )
 
 
-class DeferredMockCallable(object):
+class DeferredMockCallable:
     """A callable instance that stores a set of pending call expectations and
     return values for them. It allows a unit test to assert that the given set
     of function calls are eventually made, by awaiting on them to be called.

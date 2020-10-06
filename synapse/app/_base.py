@@ -28,6 +28,7 @@ from twisted.protocols.tls import TLSMemoryBIOFactory
 
 import synapse
 from synapse.app import check_bind_error
+from synapse.app.phone_stats_home import start_phone_stats_home
 from synapse.config.server import ListenerConfig
 from synapse.crypto import context_factory
 from synapse.logging.context import PreserveLoggingContext
@@ -271,8 +272,18 @@ def start(hs: "synapse.server.HomeServer", listeners: Iterable[ListenerConfig]):
         hs.get_datastore().db_pool.start_profiling()
         hs.get_pusherpool().start()
 
+        # Log when we start the shut down process.
+        hs.get_reactor().addSystemEventTrigger(
+            "before", "shutdown", logger.info, "Shutting down..."
+        )
+
         setup_sentry(hs)
         setup_sdnotify(hs)
+
+        # If background tasks are running on the main process, start collecting the
+        # phone home stats.
+        if hs.config.run_background_tasks:
+            start_phone_stats_home(hs)
 
         # We now freeze all allocated objects in the hopes that (almost)
         # everything currently allocated are things that will be used for the
@@ -334,6 +345,13 @@ def install_dns_limiter(reactor, max_dns_requests_in_flight=100):
     This is to workaround https://twistedmatrix.com/trac/ticket/9620, where we
     can run out of file descriptors and infinite loop if we attempt to do too
     many DNS queries at once
+
+    XXX: I'm confused by this. reactor.nameResolver does not use twisted.names unless
+    you explicitly install twisted.names as the resolver; rather it uses a GAIResolver
+    backed by the reactor's default threadpool (which is limited to 10 threads). So
+    (a) I don't understand why twisted ticket 9620 is relevant, and (b) I don't
+    understand why we would run out of FDs if we did too many lookups at once.
+    -- richvdh 2020/08/29
     """
     new_resolver = _LimitedHostnameResolver(
         reactor.nameResolver, max_dns_requests_in_flight
@@ -342,7 +360,7 @@ def install_dns_limiter(reactor, max_dns_requests_in_flight=100):
     reactor.installNameResolver(new_resolver)
 
 
-class _LimitedHostnameResolver(object):
+class _LimitedHostnameResolver:
     """Wraps a IHostnameResolver, limiting the number of in-flight DNS lookups.
     """
 
@@ -402,7 +420,7 @@ class _LimitedHostnameResolver(object):
             yield deferred
 
 
-class _DeferredResolutionReceiver(object):
+class _DeferredResolutionReceiver:
     """Wraps a IResolutionReceiver and simply resolves the given deferred when
     resolution is complete
     """

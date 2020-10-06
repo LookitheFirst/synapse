@@ -41,6 +41,7 @@ from synapse.http.endpoint import parse_and_validate_server_name
 from synapse.storage.state import StateFilter
 from synapse.types import (
     JsonDict,
+    MutableStateMap,
     Requester,
     RoomAlias,
     RoomID,
@@ -51,7 +52,7 @@ from synapse.types import (
     create_requester,
 )
 from synapse.util import stringutils
-from synapse.util.async_helpers import Linearizer, maybe_awaitable
+from synapse.util.async_helpers import Linearizer
 from synapse.util.caches.response_cache import ResponseCache
 from synapse.visibility import filter_events_for_client
 
@@ -69,7 +70,7 @@ FIVE_MINUTES_IN_MS = 5 * 60 * 1000
 
 class RoomCreationHandler(BaseHandler):
     def __init__(self, hs: "HomeServer"):
-        super(RoomCreationHandler, self).__init__(hs)
+        super().__init__(hs)
 
         self.spam_checker = hs.get_spam_checker()
         self.event_creation_handler = hs.get_event_creation_handler()
@@ -136,6 +137,9 @@ class RoomCreationHandler(BaseHandler):
 
         Returns:
             the new room id
+
+        Raises:
+            ShadowBanError if the requester is shadow-banned.
         """
         await self.ratelimit(requester)
 
@@ -171,6 +175,15 @@ class RoomCreationHandler(BaseHandler):
     async def _upgrade_room(
         self, requester: Requester, old_room_id: str, new_version: RoomVersion
     ):
+        """
+        Args:
+            requester: the user requesting the upgrade
+            old_room_id: the id of the room to be replaced
+            new_versions: the version to upgrade the room to
+
+        Raises:
+            ShadowBanError if the requester is shadow-banned.
+        """
         user_id = requester.user.to_string()
 
         # start by allocating a new room id
@@ -257,6 +270,9 @@ class RoomCreationHandler(BaseHandler):
             old_room_id: the id of the room to be replaced
             new_room_id: the id of the replacement room
             old_room_state: the state map for the old room
+
+        Raises:
+            ShadowBanError if the requester is shadow-banned.
         """
         old_room_pl_event_id = old_room_state.get((EventTypes.PowerLevels, ""))
 
@@ -435,7 +451,7 @@ class RoomCreationHandler(BaseHandler):
         old_room_member_state_events = await self.store.get_events(
             old_room_member_state_ids.values()
         )
-        for k, old_event in old_room_member_state_events.items():
+        for old_event in old_room_member_state_events.values():
             # Only transfer ban events
             if (
                 "membership" in old_event.content
@@ -665,6 +681,15 @@ class RoomCreationHandler(BaseHandler):
             creator_id=user_id, is_public=is_public, room_version=room_version,
         )
 
+        # Check whether this visibility value is blocked by a third party module
+        allowed_by_third_party_rules = await (
+            self.third_party_event_rules.check_visibility_can_be_modified(
+                room_id, visibility
+            )
+        )
+        if not allowed_by_third_party_rules:
+            raise SynapseError(403, "Room visibility value not allowed.")
+
         directory_handler = self.hs.get_handlers().directory_handler
         if room_alias:
             await directory_handler.create_association(
@@ -798,7 +823,9 @@ class RoomCreationHandler(BaseHandler):
 
         # Always wait for room creation to progate before returning
         await self._replication.wait_for_stream_position(
-            self.hs.config.worker.writers.events, "events", last_stream_id
+            self.hs.config.worker.events_shard_config.get_instance(room_id),
+            "events",
+            last_stream_id,
         )
 
         return result, last_stream_id
@@ -809,7 +836,7 @@ class RoomCreationHandler(BaseHandler):
         room_id: str,
         preset_config: str,
         invite_list: List[str],
-        initial_state: StateMap,
+        initial_state: MutableStateMap,
         creation_content: JsonDict,
         room_alias: Optional[RoomAlias] = None,
         power_level_content_override: Optional[JsonDict] = None,
@@ -839,11 +866,13 @@ class RoomCreationHandler(BaseHandler):
         async def send(etype: str, content: JsonDict, **kwargs) -> int:
             event = create(etype, content, **kwargs)
             logger.debug("Sending %s in new room", etype)
+            # Allow these events to be sent even if the user is shadow-banned to
+            # allow the room creation to complete.
             (
                 _,
                 last_stream_id,
             ) = await self.event_creation_handler.create_and_send_nonmember_event(
-                creator, event, ratelimit=False
+                creator, event, ratelimit=False, ignore_shadow_ban=True,
             )
             return last_stream_id
 
@@ -952,8 +981,6 @@ class RoomCreationHandler(BaseHandler):
             try:
                 random_string = stringutils.random_string(18)
                 gen_room_id = RoomID(random_string, self.hs.hostname).to_string()
-                if isinstance(gen_room_id, bytes):
-                    gen_room_id = gen_room_id.decode("utf-8")
                 await self.store.store_room(
                     room_id=gen_room_id,
                     room_creator_user_id=creator_id,
@@ -966,7 +993,7 @@ class RoomCreationHandler(BaseHandler):
         raise StoreError(500, "Couldn't generate a room ID.")
 
 
-class RoomContextHandler(object):
+class RoomContextHandler:
     def __init__(self, hs: "HomeServer"):
         self.hs = hs
         self.store = hs.get_datastore()
@@ -1067,36 +1094,37 @@ class RoomContextHandler(object):
         # the token, which we replace.
         token = StreamToken.START
 
-        results["start"] = token.copy_and_replace(
+        results["start"] = await token.copy_and_replace(
             "room_key", results["start"]
-        ).to_string()
+        ).to_string(self.store)
 
-        results["end"] = token.copy_and_replace("room_key", results["end"]).to_string()
+        results["end"] = await token.copy_and_replace(
+            "room_key", results["end"]
+        ).to_string(self.store)
 
         return results
 
 
-class RoomEventSource(object):
+class RoomEventSource:
     def __init__(self, hs: "HomeServer"):
         self.store = hs.get_datastore()
 
     async def get_new_events(
         self,
         user: UserID,
-        from_key: str,
+        from_key: RoomStreamToken,
         limit: int,
         room_ids: List[str],
         is_guest: bool,
         explicit_room_id: Optional[str] = None,
-    ) -> Tuple[List[EventBase], str]:
+    ) -> Tuple[List[EventBase], RoomStreamToken]:
         # We just ignore the key for now.
 
         to_key = self.get_current_key()
 
-        from_token = RoomStreamToken.parse(from_key)
-        if from_token.topological:
+        if from_key.topological:
             logger.warning("Stream has topological part!!!! %r", from_key)
-            from_key = "s%s" % (from_token.stream,)
+            from_key = RoomStreamToken(None, from_key.stream)
 
         app_service = self.store.get_app_service_by_user_id(user.to_string())
         if app_service:
@@ -1131,14 +1159,14 @@ class RoomEventSource(object):
 
         return (events, end_key)
 
-    def get_current_key(self) -> str:
-        return "s%d" % (self.store.get_room_max_stream_ordering(),)
+    def get_current_key(self) -> RoomStreamToken:
+        return self.store.get_room_max_token()
 
     def get_current_key_for_room(self, room_id: str) -> Awaitable[str]:
         return self.store.get_room_events_max_id(room_id)
 
 
-class RoomShutdownHandler(object):
+class RoomShutdownHandler:
 
     DEFAULT_MESSAGE = (
         "Sharing illegal content on this server is not permitted and rooms in"
@@ -1252,10 +1280,10 @@ class RoomShutdownHandler(object):
             # We now wait for the create room to come back in via replication so
             # that we can assume that all the joins/invites have propogated before
             # we try and auto join below.
-            #
-            # TODO: Currently the events stream is written to from master
             await self._replication.wait_for_stream_position(
-                self.hs.config.worker.writers.events, "events", stream_id
+                self.hs.config.worker.events_shard_config.get_instance(new_room_id),
+                "events",
+                stream_id,
             )
         else:
             new_room_id = None
@@ -1285,7 +1313,9 @@ class RoomShutdownHandler(object):
 
                 # Wait for leave to come in over replication before trying to forget.
                 await self._replication.wait_for_stream_position(
-                    self.hs.config.worker.writers.events, "events", stream_id
+                    self.hs.config.worker.events_shard_config.get_instance(room_id),
+                    "events",
+                    stream_id,
                 )
 
                 await self.room_member_handler.forget(target_requester.user, room_id)
@@ -1322,9 +1352,7 @@ class RoomShutdownHandler(object):
                 ratelimit=False,
             )
 
-            aliases_for_room = await maybe_awaitable(
-                self.store.get_aliases_for_room(room_id)
-            )
+            aliases_for_room = await self.store.get_aliases_for_room(room_id)
 
             await self.store.update_aliases_for_room(
                 room_id, new_room_id, requester_user_id

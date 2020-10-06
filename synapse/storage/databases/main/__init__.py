@@ -15,9 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import calendar
 import logging
-import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from synapse.api.constants import PresenceState
 from synapse.config.homeserver import HomeServerConfig
@@ -28,6 +27,7 @@ from synapse.storage.util.id_generators import (
     MultiWriterIdGenerator,
     StreamIdGenerator,
 )
+from synapse.types import get_domain_from_id
 from synapse.util.caches.stream_change_cache import StreamChangeCache
 
 from .account_data import AccountDataStore
@@ -158,19 +158,25 @@ class DataStore(
         )
 
         if isinstance(self.database_engine, PostgresEngine):
+            # We set the `writers` to an empty list here as we don't care about
+            # missing updates over restarts, as we'll not have anything in our
+            # caches to invalidate. (This reduces the amount of writes to the DB
+            # that happen).
             self._cache_id_gen = MultiWriterIdGenerator(
                 db_conn,
                 database,
-                instance_name="master",
+                stream_name="caches",
+                instance_name=hs.get_instance_name(),
                 table="cache_invalidation_stream_by_instance",
                 instance_column="instance_name",
                 id_column="stream_id",
                 sequence_name="cache_invalidation_stream_seq",
+                writers=[],
             )
         else:
             self._cache_id_gen = None
 
-        super(DataStore, self).__init__(database, db_conn, hs)
+        super().__init__(database, db_conn, hs)
 
         self._presence_on_startup = self._get_active_presence(db_conn)
 
@@ -260,8 +266,8 @@ class DataStore(
         self._stream_order_on_start = self.get_room_max_stream_ordering()
         self._min_stream_order_on_start = self.get_room_min_stream_ordering()
 
-        # Used in _generate_user_daily_visits to keep track of progress
-        self._last_user_visit_update = self._get_start_of_day()
+    def get_device_stream_token(self) -> int:
+        return self._device_list_id_gen.get_current_token()
 
     def take_presence_startup_info(self):
         active_on_startup = self._presence_on_startup
@@ -278,7 +284,6 @@ class DataStore(
             " last_user_sync_ts, status_msg, currently_active FROM presence_stream"
             " WHERE state != ?"
         )
-        sql = self.database_engine.convert_param_style(sql)
 
         txn = db_conn.cursor()
         txn.execute(sql, (PresenceState.OFFLINE,))
@@ -290,200 +295,13 @@ class DataStore(
 
         return [UserPresenceState(**row) for row in rows]
 
-    def count_daily_users(self):
-        """
-        Counts the number of users who used this homeserver in the last 24 hours.
-        """
-        yesterday = int(self._clock.time_msec()) - (1000 * 60 * 60 * 24)
-        return self.db_pool.runInteraction(
-            "count_daily_users", self._count_users, yesterday
-        )
-
-    def count_monthly_users(self):
-        """
-        Counts the number of users who used this homeserver in the last 30 days.
-        Note this method is intended for phonehome metrics only and is different
-        from the mau figure in synapse.storage.monthly_active_users which,
-        amongst other things, includes a 3 day grace period before a user counts.
-        """
-        thirty_days_ago = int(self._clock.time_msec()) - (1000 * 60 * 60 * 24 * 30)
-        return self.db_pool.runInteraction(
-            "count_monthly_users", self._count_users, thirty_days_ago
-        )
-
-    def _count_users(self, txn, time_from):
-        """
-        Returns number of users seen in the past time_from period
-        """
-        sql = """
-            SELECT COALESCE(count(*), 0) FROM (
-                SELECT user_id FROM user_ips
-                WHERE last_seen > ?
-                GROUP BY user_id
-            ) u
-        """
-        txn.execute(sql, (time_from,))
-        (count,) = txn.fetchone()
-        return count
-
-    def count_r30_users(self):
-        """
-        Counts the number of 30 day retained users, defined as:-
-         * Users who have created their accounts more than 30 days ago
-         * Where last seen at most 30 days ago
-         * Where account creation and last_seen are > 30 days apart
-
-         Returns counts globaly for a given user as well as breaking
-         by platform
-        """
-
-        def _count_r30_users(txn):
-            thirty_days_in_secs = 86400 * 30
-            now = int(self._clock.time())
-            thirty_days_ago_in_secs = now - thirty_days_in_secs
-
-            sql = """
-                SELECT platform, COALESCE(count(*), 0) FROM (
-                     SELECT
-                        users.name, platform, users.creation_ts * 1000,
-                        MAX(uip.last_seen)
-                     FROM users
-                     INNER JOIN (
-                         SELECT
-                         user_id,
-                         last_seen,
-                         CASE
-                             WHEN user_agent LIKE '%%Android%%' THEN 'android'
-                             WHEN user_agent LIKE '%%iOS%%' THEN 'ios'
-                             WHEN user_agent LIKE '%%Electron%%' THEN 'electron'
-                             WHEN user_agent LIKE '%%Mozilla%%' THEN 'web'
-                             WHEN user_agent LIKE '%%Gecko%%' THEN 'web'
-                             ELSE 'unknown'
-                         END
-                         AS platform
-                         FROM user_ips
-                     ) uip
-                     ON users.name = uip.user_id
-                     AND users.appservice_id is NULL
-                     AND users.creation_ts < ?
-                     AND uip.last_seen/1000 > ?
-                     AND (uip.last_seen/1000) - users.creation_ts > 86400 * 30
-                     GROUP BY users.name, platform, users.creation_ts
-                ) u GROUP BY platform
-            """
-
-            results = {}
-            txn.execute(sql, (thirty_days_ago_in_secs, thirty_days_ago_in_secs))
-
-            for row in txn:
-                if row[0] == "unknown":
-                    pass
-                results[row[0]] = row[1]
-
-            sql = """
-                SELECT COALESCE(count(*), 0) FROM (
-                    SELECT users.name, users.creation_ts * 1000,
-                                                        MAX(uip.last_seen)
-                    FROM users
-                    INNER JOIN (
-                        SELECT
-                        user_id,
-                        last_seen
-                        FROM user_ips
-                    ) uip
-                    ON users.name = uip.user_id
-                    AND appservice_id is NULL
-                    AND users.creation_ts < ?
-                    AND uip.last_seen/1000 > ?
-                    AND (uip.last_seen/1000) - users.creation_ts > 86400 * 30
-                    GROUP BY users.name, users.creation_ts
-                ) u
-            """
-
-            txn.execute(sql, (thirty_days_ago_in_secs, thirty_days_ago_in_secs))
-
-            (count,) = txn.fetchone()
-            results["all"] = count
-
-            return results
-
-        return self.db_pool.runInteraction("count_r30_users", _count_r30_users)
-
-    def _get_start_of_day(self):
-        """
-        Returns millisecond unixtime for start of UTC day.
-        """
-        now = time.gmtime()
-        today_start = calendar.timegm((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0))
-        return today_start * 1000
-
-    def generate_user_daily_visits(self):
-        """
-        Generates daily visit data for use in cohort/ retention analysis
-        """
-
-        def _generate_user_daily_visits(txn):
-            logger.info("Calling _generate_user_daily_visits")
-            today_start = self._get_start_of_day()
-            a_day_in_milliseconds = 24 * 60 * 60 * 1000
-            now = self.clock.time_msec()
-
-            sql = """
-                INSERT INTO user_daily_visits (user_id, device_id, timestamp)
-                    SELECT u.user_id, u.device_id, ?
-                    FROM user_ips AS u
-                    LEFT JOIN (
-                      SELECT user_id, device_id, timestamp FROM user_daily_visits
-                      WHERE timestamp = ?
-                    ) udv
-                    ON u.user_id = udv.user_id AND u.device_id=udv.device_id
-                    INNER JOIN users ON users.name=u.user_id
-                    WHERE last_seen > ? AND last_seen <= ?
-                    AND udv.timestamp IS NULL AND users.is_guest=0
-                    AND users.appservice_id IS NULL
-                    GROUP BY u.user_id, u.device_id
-            """
-
-            # This means that the day has rolled over but there could still
-            # be entries from the previous day. There is an edge case
-            # where if the user logs in at 23:59 and overwrites their
-            # last_seen at 00:01 then they will not be counted in the
-            # previous day's stats - it is important that the query is run
-            # often to minimise this case.
-            if today_start > self._last_user_visit_update:
-                yesterday_start = today_start - a_day_in_milliseconds
-                txn.execute(
-                    sql,
-                    (
-                        yesterday_start,
-                        yesterday_start,
-                        self._last_user_visit_update,
-                        today_start,
-                    ),
-                )
-                self._last_user_visit_update = today_start
-
-            txn.execute(
-                sql, (today_start, today_start, self._last_user_visit_update, now)
-            )
-            # Update _last_user_visit_update to now. The reason to do this
-            # rather just clamping to the beginning of the day is to limit
-            # the size of the join - meaning that the query can be run more
-            # frequently
-            self._last_user_visit_update = now
-
-        return self.db_pool.runInteraction(
-            "generate_user_daily_visits", _generate_user_daily_visits
-        )
-
-    def get_users(self):
+    async def get_users(self) -> List[Dict[str, Any]]:
         """Function to retrieve a list of users in users table.
 
-        Args:
         Returns:
-            defer.Deferred: resolves to list[dict[str, Any]]
+            A list of dictionaries representing users.
         """
-        return self.db_pool.simple_select_list(
+        return await self.db_pool.simple_select_list(
             table="users",
             keyvalues={},
             retcols=[
@@ -497,30 +315,40 @@ class DataStore(
             desc="get_users",
         )
 
-    def get_users_paginate(
-        self, start, limit, name=None, guests=True, deactivated=False
-    ):
+    async def get_users_paginate(
+        self,
+        start: int,
+        limit: int,
+        user_id: Optional[str] = None,
+        name: Optional[str] = None,
+        guests: bool = True,
+        deactivated: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], int]:
         """Function to retrieve a paginated list of users from
         users list. This will return a json list of users and the
         total number of users matching the filter criteria.
 
         Args:
-            start (int): start number to begin the query from
-            limit (int): number of rows to retrieve
-            name (string): filter for user names
-            guests (bool): whether to in include guest users
-            deactivated (bool): whether to include deactivated users
+            start: start number to begin the query from
+            limit: number of rows to retrieve
+            user_id: search for user_id. ignored if name is not None
+            name: search for local part of user_id or display name
+            guests: whether to in include guest users
+            deactivated: whether to include deactivated users
         Returns:
-            defer.Deferred: resolves to list[dict[str, Any]], int
+            A tuple of a list of mappings from user to information and a count of total users.
         """
 
         def get_users_paginate_txn(txn):
             filters = []
-            args = []
+            args = [self.hs.config.server_name]
 
             if name:
+                filters.append("(name LIKE ? OR displayname LIKE ?)")
+                args.extend(["@%" + name + "%:%", "%" + name + "%"])
+            elif user_id:
                 filters.append("name LIKE ?")
-                args.append("%" + name + "%")
+                args.extend(["%" + user_id + "%"])
 
             if not guests:
                 filters.append("is_guest = 0")
@@ -530,39 +358,42 @@ class DataStore(
 
             where_clause = "WHERE " + " AND ".join(filters) if len(filters) > 0 else ""
 
-            sql = "SELECT COUNT(*) as total_users FROM users %s" % (where_clause)
-            txn.execute(sql, args)
-            count = txn.fetchone()[0]
-
-            args = [self.hs.config.server_name] + args + [limit, start]
-            sql = """
-                SELECT name, user_type, is_guest, admin, deactivated, displayname, avatar_url
+            sql_base = """
                 FROM users as u
                 LEFT JOIN profiles AS p ON u.name = '@' || p.user_id || ':' || ?
                 {}
-                ORDER BY u.name LIMIT ? OFFSET ?
                 """.format(
                 where_clause
             )
+            sql = "SELECT COUNT(*) as total_users " + sql_base
+            txn.execute(sql, args)
+            count = txn.fetchone()[0]
+
+            sql = (
+                "SELECT name, user_type, is_guest, admin, deactivated, displayname, avatar_url "
+                + sql_base
+                + " ORDER BY u.name LIMIT ? OFFSET ?"
+            )
+            args += [limit, start]
             txn.execute(sql, args)
             users = self.db_pool.cursor_to_dict(txn)
             return users, count
 
-        return self.db_pool.runInteraction(
+        return await self.db_pool.runInteraction(
             "get_users_paginate_txn", get_users_paginate_txn
         )
 
-    def search_users(self, term):
+    async def search_users(self, term: str) -> Optional[List[Dict[str, Any]]]:
         """Function to search users list for one or more users with
         the matched term.
 
         Args:
-            term (str): search term
-            col (str): column to query term should be matched to
+            term: search term
+
         Returns:
-            defer.Deferred: resolves to list[dict[str, Any]]
+            A list of dictionaries or None.
         """
-        return self.db_pool.simple_search_list(
+        return await self.db_pool.simple_search_list(
             table="users",
             term=term,
             col="name",
@@ -575,21 +406,24 @@ def check_database_before_upgrade(cur, database_engine, config: HomeServerConfig
     """Called before upgrading an existing database to check that it is broadly sane
     compared with the configuration.
     """
-    domain = config.server_name
+    logger.info("Checking database for consistency with configuration...")
 
-    sql = database_engine.convert_param_style(
-        "SELECT COUNT(*) FROM users WHERE name NOT LIKE ?"
-    )
-    pat = "%:" + domain
-    cur.execute(sql, (pat,))
-    num_not_matching = cur.fetchall()[0][0]
-    if num_not_matching == 0:
+    # if there are any users in the database, check that the username matches our
+    # configured server name.
+
+    cur.execute("SELECT name FROM users LIMIT 1")
+    rows = cur.fetchall()
+    if not rows:
+        return
+
+    user_domain = get_domain_from_id(rows[0][0])
+    if user_domain == config.server_name:
         return
 
     raise Exception(
         "Found users in database not native to %s!\n"
-        "You cannot changed a synapse server_name after it's been configured"
-        % (domain,)
+        "You cannot change a synapse server_name after it's been configured"
+        % (config.server_name,)
     )
 
 

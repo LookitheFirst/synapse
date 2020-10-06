@@ -16,6 +16,7 @@
 
 import hmac
 import logging
+import random
 from typing import List, Union
 
 import synapse
@@ -75,7 +76,7 @@ class EmailRegisterRequestTokenRestServlet(RestServlet):
         Args:
             hs (synapse.server.HomeServer): server
         """
-        super(EmailRegisterRequestTokenRestServlet, self).__init__()
+        super().__init__()
         self.hs = hs
         self.identity_handler = hs.get_handlers().identity_handler
         self.config = hs.config
@@ -131,6 +132,9 @@ class EmailRegisterRequestTokenRestServlet(RestServlet):
             if self.hs.config.request_token_inhibit_3pid_errors:
                 # Make the client think the operation succeeded. See the rationale in the
                 # comments for request_token_inhibit_3pid_errors.
+                # Also wait for some random amount of time between 100ms and 1s to make it
+                # look like we did something.
+                await self.hs.clock.sleep(random.randint(1, 10) / 10)
                 return 200, {"sid": random_string(16)}
 
             raise SynapseError(400, "Email is already in use", Codes.THREEPID_IN_USE)
@@ -170,7 +174,7 @@ class MsisdnRegisterRequestTokenRestServlet(RestServlet):
         Args:
             hs (synapse.server.HomeServer): server
         """
-        super(MsisdnRegisterRequestTokenRestServlet, self).__init__()
+        super().__init__()
         self.hs = hs
         self.identity_handler = hs.get_handlers().identity_handler
 
@@ -203,6 +207,9 @@ class MsisdnRegisterRequestTokenRestServlet(RestServlet):
             if self.hs.config.request_token_inhibit_3pid_errors:
                 # Make the client think the operation succeeded. See the rationale in the
                 # comments for request_token_inhibit_3pid_errors.
+                # Also wait for some random amount of time between 100ms and 1s to make it
+                # look like we did something.
+                await self.hs.clock.sleep(random.randint(1, 10) / 10)
                 return 200, {"sid": random_string(16)}
 
             raise SynapseError(
@@ -242,7 +249,7 @@ class RegistrationSubmitTokenServlet(RestServlet):
         Args:
             hs (synapse.server.HomeServer): server
         """
-        super(RegistrationSubmitTokenServlet, self).__init__()
+        super().__init__()
         self.hs = hs
         self.auth = hs.get_auth()
         self.config = hs.config
@@ -312,7 +319,7 @@ class UsernameAvailabilityRestServlet(RestServlet):
         Args:
             hs (synapse.server.HomeServer): server
         """
-        super(UsernameAvailabilityRestServlet, self).__init__()
+        super().__init__()
         self.hs = hs
         self.registration_handler = hs.get_registration_handler()
         self.ratelimiter = FederationRateLimiter(
@@ -356,7 +363,7 @@ class RegisterRestServlet(RestServlet):
         Args:
             hs (synapse.server.HomeServer): server
         """
-        super(RegisterRestServlet, self).__init__()
+        super().__init__()
 
         self.hs = hs
         self.auth = hs.get_auth()
@@ -424,11 +431,14 @@ class RegisterRestServlet(RestServlet):
 
             access_token = self.auth.get_access_token_from_request(request)
 
-            if isinstance(desired_username, str):
-                result = await self._do_appservice_registration(
-                    desired_username, access_token, body
-                )
-            return 200, result  # we throw for non 200 responses
+            if not isinstance(desired_username, str):
+                raise SynapseError(400, "Desired Username is missing or not a string")
+
+            result = await self._do_appservice_registration(
+                desired_username, access_token, body
+            )
+
+            return 200, result
 
         # == Normal User Registration == (everyone else)
         if not self._registration_enabled:
@@ -651,7 +661,7 @@ class RegisterRestServlet(RestServlet):
             (object) params: registration parameters, from which we pull
                 device_id, initial_device_name and inhibit_login
         Returns:
-            (object) dictionary for response from /register
+             dictionary for response from /register
         """
         result = {"user_id": user_id, "home_server": self.hs.hostname}
         if not params.get("inhibit_login", False):

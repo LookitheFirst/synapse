@@ -58,7 +58,7 @@ class _InvalidMacaroonException(Exception):
     pass
 
 
-class Auth(object):
+class Auth:
     """
     FIXME: This class contains a mix of functions for authenticating users
     of our client-server API and authenticating events added to room graphs.
@@ -218,11 +218,7 @@ class Auth(object):
             # Deny the request if the user account has expired.
             if self._account_validity.enabled and not allow_expired:
                 user_id = user.to_string()
-                expiration_ts = await self.store.get_expiration_ts_for_user(user_id)
-                if (
-                    expiration_ts is not None
-                    and self.clock.time_msec() >= expiration_ts
-                ):
+                if await self.store.is_account_expired(user_id, self.clock.time_msec()):
                     raise AuthError(
                         403, "User account has expired", errcode=Codes.EXPIRED_ACCOUNT
                     )

@@ -23,6 +23,7 @@ from synapse.api.errors import (
     CodeMessageException,
     Codes,
     NotFoundError,
+    ShadowBanError,
     StoreError,
     SynapseError,
 )
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 class DirectoryHandler(BaseHandler):
     def __init__(self, hs):
-        super(DirectoryHandler, self).__init__(hs)
+        super().__init__(hs)
 
         self.state = hs.get_state_handler()
         self.appservice_handler = hs.get_application_service_handler()
@@ -45,6 +46,7 @@ class DirectoryHandler(BaseHandler):
         self.config = hs.config
         self.enable_room_list_search = hs.config.enable_room_list_search
         self.require_membership = hs.config.require_membership_for_aliases
+        self.third_party_event_rules = hs.get_third_party_event_rules()
 
         self.federation = hs.get_federation_client()
         hs.get_federation_registry().register_query_handler(
@@ -199,6 +201,8 @@ class DirectoryHandler(BaseHandler):
 
         try:
             await self._update_canonical_alias(requester, user_id, room_id, room_alias)
+        except ShadowBanError as e:
+            logger.info("Failed to update alias events due to shadow-ban: %s", e)
         except AuthError as e:
             logger.info("Failed to update alias events: %s", e)
 
@@ -292,6 +296,9 @@ class DirectoryHandler(BaseHandler):
         """
         Send an updated canonical alias event if the removed alias was set as
         the canonical alias or listed in the alt_aliases field.
+
+        Raises:
+            ShadowBanError if the requester has been shadow-banned.
         """
         alias_event = await self.state.get_current_state(
             room_id, EventTypes.CanonicalAlias, ""
@@ -377,7 +384,7 @@ class DirectoryHandler(BaseHandler):
         """
         creator = await self.store.get_room_alias_creator(alias.to_string())
 
-        if creator is not None and creator == user_id:
+        if creator == user_id:
             return True
 
         # Resolve the alias to the corresponding room.
@@ -446,6 +453,15 @@ class DirectoryHandler(BaseHandler):
                 # Lets just return a generic message, as there may be all sorts of
                 # reasons why we said no. TODO: Allow configurable error messages
                 # per alias creation rule?
+                raise SynapseError(403, "Not allowed to publish room")
+
+            # Check if publishing is blocked by a third party module
+            allowed_by_third_party_rules = await (
+                self.third_party_event_rules.check_visibility_can_be_modified(
+                    room_id, visibility
+                )
+            )
+            if not allowed_by_third_party_rules:
                 raise SynapseError(403, "Not allowed to publish room")
 
         await self.store.set_room_is_public(room_id, making_public)
